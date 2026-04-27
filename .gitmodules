@@ -1,0 +1,3 @@
+[submodule "NArk"]
+	path = submodules/NArk
+	url = https://github.com/arkade-os/dotnet-sdk
