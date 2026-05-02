@@ -196,6 +196,38 @@ public sealed class CdkPaymentProcessorGrpcService : Proto.CdkPaymentProcessor.C
         }
     }
 
+    public override async Task WaitIncomingPayment(
+        Proto.EmptyRequest request,
+        IServerStreamWriter<Proto.WaitIncomingPaymentResponse> responseStream,
+        ServerCallContext context)
+    {
+        while (!context.CancellationToken.IsCancellationRequested)
+        {
+            var paid = await _lightning.GetNewlyPaidIncoming(_context.Options.WalletId, _eventCursor, context.CancellationToken);
+            _eventCursor = DateTimeOffset.UtcNow;
+
+            foreach (var invoice in paid)
+            {
+                await responseStream.WriteAsync(new Proto.WaitIncomingPaymentResponse
+                {
+                    PaymentIdentifier = new Proto.PaymentIdentifier
+                    {
+                        Type = Proto.PaymentIdentifierType.PaymentId,
+                        Id = invoice.Id
+                    },
+                    PaymentAmount = new Proto.AmountMessage
+                    {
+                        Value = (ulong)(invoice.Amount?.ToUnit(LightMoneyUnit.Satoshi) ?? 0),
+                        Unit = _context.Options.Unit
+                    },
+                    PaymentId = invoice.Id
+                });
+            }
+
+            await Task.Delay(TimeSpan.FromSeconds(2), context.CancellationToken);
+        }
+    }
+
     private async Task<LightningInvoice?> ResolveIncoming(Proto.PaymentIdentifier id, CancellationToken ct)
     {
         return id.Type switch

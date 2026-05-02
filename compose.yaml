@@ -1,0 +1,50 @@
+services:
+  cdk-arkade-payment-processor:
+    container_name: cdk-arkade-payment-processor
+    platform: linux/amd64
+    build:
+      context: .
+      dockerfile: NArkNut/Dockerfile
+    environment:
+      ASPNETCORE_ENVIRONMENT: ${ASPNETCORE_ENVIRONMENT:-Development}
+      ASPNETCORE_URLS: ${ASPNETCORE_URLS:-http://+:8080}
+      Kestrel__EndpointDefaults__Protocols: Http2
+      ConnectionStrings__Ark: Host=postgres;Port=5432;Database=${PROCESSOR_DB:-cdk_arkade_processor};Username=${POSTGRES_USER:-postgres};Password=${POSTGRES_PASSWORD:-postgres};GSS Encryption Mode=Disable
+      ArkNetwork__ArkUri: ${ARK_URI:-http://ark:7070}
+      ArkNetwork__ArkadeWalletUri: ${ARKADE_WALLET_URI:-http://arkade-wallet:80}
+      ArkNetwork__BoltzUri: ${BOLTZ_URI:-http://nginx-boltz:9069/}
+      ArkNetwork__ExplorerUri: ${EXPLORER_URI:-http://chopsticks:3000}
+      NBXplorer__Uri: ${NBXPLORER_URI:-http://nbxplorer:32838/}
+      NBXplorer__Network: ${NBXPLORER_NETWORK:-Regtest}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "${PROCESSOR_PORT:-8080}:8080"
+    restart: unless-stopped
+    networks:
+      - default
+      - nigiri
+
+  cdk-mintd:
+    image: cashubtc/mintd:latest
+    container_name: cdk-mintd
+    restart: unless-stopped
+    ports:
+      - "${CDK_MINT_PORT:-3338}:8085"
+    environment:
+      CDK_MINTD_LISTEN_HOST: 0.0.0.0
+      CDK_MINTD_LISTEN_PORT: 8085
+      CDK_MINTD_DATABASE: sqlite
+      CDK_MINTD_MNEMONIC: "monkey chase banana monkey chase banana monkey chase banana monkey chase wrong"
+      CDK_MINTD_LN_BACKEND: grpcprocessor
+      CDK_MINTD_GRPC_PAYMENT_PROCESSOR_SUPPORTED_UNITS: sat
+      CDK_MINTD_GRPC_PAYMENT_PROCESSOR_ADDRESS: http://cdk-arkade-payment-processor
+      CDK_MINTD_GRPC_PAYMENT_PROCESSOR_PORT: 8080
+    depends_on:
+      - cdk-arkade-payment-processor
+    networks:
+      - default
+
+networks:
+  nigiri:
+    external: true

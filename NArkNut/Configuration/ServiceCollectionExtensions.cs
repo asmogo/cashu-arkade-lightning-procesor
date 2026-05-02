@@ -23,9 +23,10 @@ public static class ServiceCollectionExtensions
         IConfiguration configuration)
     {
         services.AddArkadePaymentProcessorConfiguration(configuration);
+        services.AddHttpClient();
 
         var connectionString = configuration.GetConnectionString("Ark")
-                               ?? "Host=localhost;Port=5432;Database=cdk_arkade_processor;Username=postgres;Password=postgres";
+                               ?? "Host=localhost;Port=5432;Database=cdk_arkade_processor;Username=postgres;Password=postgres;GSS Encryption Mode=Disable";
 
         services.AddDbContextFactory<ProcessorDbContext>(options => options.UseNpgsql(connectionString));
         services.AddArkEfCoreStorage<ProcessorDbContext>();

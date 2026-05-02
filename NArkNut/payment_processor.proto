@@ -9,6 +9,7 @@ service CdkPaymentProcessor {
   rpc MakePayment(MakePaymentRequest) returns (MakePaymentResponse) {}
   rpc CheckIncomingPayment(CheckIncomingPaymentRequest) returns (CheckIncomingPaymentResponse) {}
   rpc CheckOutgoingPayment(CheckOutgoingPaymentRequest) returns (MakePaymentResponse) {}
+  rpc WaitIncomingPayment(EmptyRequest) returns (stream WaitIncomingPaymentResponse) {}
   rpc WaitPaymentEvent(EmptyRequest) returns (stream PaymentEventResponse) {}
 }
 
