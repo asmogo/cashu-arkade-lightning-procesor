@@ -1,6 +1,7 @@
 using BTCPayServer.Lightning;
 using Grpc.Core;
 using cdk_arkade_payment_processor.Configuration;
+using NArk.Swaps.Models;
 using Proto = global::CdkPaymentProcessor;
 
 namespace cdk_arkade_payment_processor.Services;
@@ -9,16 +10,21 @@ public sealed class CdkPaymentProcessorGrpcService : Proto.CdkPaymentProcessor.C
 {
     private readonly ProcessorContext _context;
     private readonly ArkSwapLightningService _lightning;
+    private readonly IncomingPaymentEventBus _incomingPaymentEvents;
     private readonly ILogger<CdkPaymentProcessorGrpcService> _logger;
-    private DateTimeOffset _eventCursor = DateTimeOffset.UtcNow;
+    private readonly NBitcoin.Network _network;
 
     public CdkPaymentProcessorGrpcService(
         ProcessorContext context,
         ArkSwapLightningService lightning,
+        IncomingPaymentEventBus incomingPaymentEvents,
+        Microsoft.Extensions.Options.IOptions<NbxplorerOptions> nbxplorerOptions,
         ILogger<CdkPaymentProcessorGrpcService> logger)
     {
         _context = context;
         _lightning = lightning;
+        _incomingPaymentEvents = incomingPaymentEvents;
+        _network = ParseNetwork(nbxplorerOptions.Value.Network);
         _logger = logger;
     }
 
@@ -31,25 +37,10 @@ public sealed class CdkPaymentProcessorGrpcService : Proto.CdkPaymentProcessor.C
             Unit = _context.Options.Unit,
             Bolt11 = new Proto.Bolt11Settings
             {
-                Mpp = true,
                 Amountless = false,
                 InvoiceDescription = true
-            },
-            Bolt12 = new Proto.Bolt12Settings
-            {
-                Amountless = false
             }
         };
-
-        response.Custom["wallet_id"] = _context.Options.WalletId;
-        response.Custom["ark_uri"] = _context.NetworkConfig.ArkUri;
-
-        if (!string.IsNullOrWhiteSpace(_context.NetworkConfig.BoltzUri))
-            response.Custom["boltz_uri"] = _context.NetworkConfig.BoltzUri;
-
-        if (!string.IsNullOrWhiteSpace(_context.Options.FundingAddress))
-            response.Custom["funding_address"] = _context.Options.FundingAddress;
-
         return Task.FromResult(response);
     }
 
@@ -57,31 +48,43 @@ public sealed class CdkPaymentProcessorGrpcService : Proto.CdkPaymentProcessor.C
         Proto.CreatePaymentRequest request,
         ServerCallContext context)
     {
-        var bolt11 = request.Options?.Bolt11 ?? throw BadRequest("Only bolt11 incoming options are supported");
-        var amount = bolt11.Amount?.Value ?? 0;
-        if (amount == 0) throw BadRequest("Amount is required");
-
-        var expirySeconds = bolt11.HasUnixExpiry
-            ? Math.Max(60, (long)bolt11.UnixExpiry - DateTimeOffset.UtcNow.ToUnixTimeSeconds())
-            : 3600;
-
-        var invoice = await _lightning.CreateInvoice(
-            _context.Options.WalletId,
-            (long)amount,
-            bolt11.Description ?? string.Empty,
-            TimeSpan.FromSeconds(expirySeconds),
-            context.CancellationToken);
-
-        return new Proto.CreatePaymentResponse
+        try
         {
-            RequestIdentifier = new Proto.PaymentIdentifier
+            var bolt11 = request.Options?.Bolt11 ?? throw BadRequest("Only bolt11 incoming options are supported");
+            var amount = bolt11.Amount?.Value ?? 0;
+            if (amount == 0) throw BadRequest("Amount is required");
+
+            var expirySeconds = bolt11.HasUnixExpiry
+                ? Math.Max(60, (long)bolt11.UnixExpiry - DateTimeOffset.UtcNow.ToUnixTimeSeconds())
+                : 3600;
+
+            var invoice = await _lightning.CreateInvoice(
+                _context.Options.WalletId,
+                (long)amount,
+                bolt11.Description ?? string.Empty,
+                TimeSpan.FromSeconds(expirySeconds),
+                context.CancellationToken);
+
+            return new Proto.CreatePaymentResponse
             {
-                Type = Proto.PaymentIdentifierType.PaymentId,
-                Id = invoice.Id
-            },
-            Request = invoice.BOLT11,
-            Expiry = (ulong)invoice.ExpiresAt.ToUnixTimeSeconds()
-        };
+                RequestIdentifier = new Proto.PaymentIdentifier
+                {
+                    Type = Proto.PaymentIdentifierType.PaymentHash,
+                    Hash = invoice.PaymentHash ?? string.Empty
+                },
+                Request = invoice.BOLT11,
+                Expiry = (ulong)invoice.ExpiresAt.ToUnixTimeSeconds()
+            };
+        }
+        catch (RpcException)
+        {
+            throw;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "CreatePayment failed for wallet {WalletId}", _context.Options.WalletId);
+            throw new RpcException(new Status(StatusCode.Internal, $"CreatePayment failed: {ex.Message}"));
+        }
     }
 
     public override Task<Proto.PaymentQuoteResponse> GetPaymentQuote(
@@ -91,7 +94,7 @@ public sealed class CdkPaymentProcessorGrpcService : Proto.CdkPaymentProcessor.C
         if (request.RequestType != Proto.OutgoingPaymentRequestType.Bolt11Invoice)
             throw BadRequest("Only bolt11 outgoing quote is supported");
 
-        var pr = BOLT11PaymentRequest.Parse(request.Request, NBitcoin.Network.Main);
+        var pr = BOLT11PaymentRequest.Parse(request.Request, _network);
         var amount = (ulong)(pr.MinimumAmount?.ToUnit(LightMoneyUnit.Satoshi) ?? 0);
 
         return Task.FromResult(new Proto.PaymentQuoteResponse
@@ -166,33 +169,11 @@ public sealed class CdkPaymentProcessorGrpcService : Proto.CdkPaymentProcessor.C
         IServerStreamWriter<Proto.PaymentEventResponse> responseStream,
         ServerCallContext context)
     {
-        while (!context.CancellationToken.IsCancellationRequested)
+        await foreach (var swap in _incomingPaymentEvents.Subscribe(context.CancellationToken))
         {
-            var paid = await _lightning.GetNewlyPaidIncoming(_context.Options.WalletId, _eventCursor, context.CancellationToken);
-            _eventCursor = DateTimeOffset.UtcNow;
-
-            foreach (var invoice in paid)
-            {
-                await responseStream.WriteAsync(new Proto.PaymentEventResponse
-                {
-                    PaymentReceived = new Proto.WaitIncomingPaymentResponse
-                    {
-                        PaymentIdentifier = new Proto.PaymentIdentifier
-                        {
-                            Type = Proto.PaymentIdentifierType.PaymentId,
-                            Id = invoice.Id
-                        },
-                        PaymentAmount = new Proto.AmountMessage
-                        {
-                            Value = (ulong)(invoice.Amount?.ToUnit(LightMoneyUnit.Satoshi) ?? 0),
-                            Unit = _context.Options.Unit
-                        },
-                        PaymentId = invoice.Id
-                    }
-                });
-            }
-
-            await Task.Delay(TimeSpan.FromSeconds(2), context.CancellationToken);
+            if (!string.Equals(swap.WalletId, _context.Options.WalletId, StringComparison.Ordinal))
+                continue;
+            await responseStream.WriteAsync(new Proto.PaymentEventResponse { PaymentReceived = MapIncomingPayment(swap) });
         }
     }
 
@@ -201,31 +182,31 @@ public sealed class CdkPaymentProcessorGrpcService : Proto.CdkPaymentProcessor.C
         IServerStreamWriter<Proto.WaitIncomingPaymentResponse> responseStream,
         ServerCallContext context)
     {
-        while (!context.CancellationToken.IsCancellationRequested)
+        await foreach (var swap in _incomingPaymentEvents.Subscribe(context.CancellationToken))
         {
-            var paid = await _lightning.GetNewlyPaidIncoming(_context.Options.WalletId, _eventCursor, context.CancellationToken);
-            _eventCursor = DateTimeOffset.UtcNow;
-
-            foreach (var invoice in paid)
-            {
-                await responseStream.WriteAsync(new Proto.WaitIncomingPaymentResponse
-                {
-                    PaymentIdentifier = new Proto.PaymentIdentifier
-                    {
-                        Type = Proto.PaymentIdentifierType.PaymentId,
-                        Id = invoice.Id
-                    },
-                    PaymentAmount = new Proto.AmountMessage
-                    {
-                        Value = (ulong)(invoice.Amount?.ToUnit(LightMoneyUnit.Satoshi) ?? 0),
-                        Unit = _context.Options.Unit
-                    },
-                    PaymentId = invoice.Id
-                });
-            }
-
-            await Task.Delay(TimeSpan.FromSeconds(2), context.CancellationToken);
+            if (!string.Equals(swap.WalletId, _context.Options.WalletId, StringComparison.Ordinal))
+                continue;
+            await responseStream.WriteAsync(MapIncomingPayment(swap));
         }
+    }
+
+    private Proto.WaitIncomingPaymentResponse MapIncomingPayment(ArkSwap swap)
+    {
+        var invoice = BOLT11PaymentRequest.Parse(swap.Invoice, _network);
+        return new Proto.WaitIncomingPaymentResponse
+        {
+            PaymentIdentifier = new Proto.PaymentIdentifier
+            {
+                Type = Proto.PaymentIdentifierType.PaymentId,
+                Id = swap.SwapId
+            },
+            PaymentAmount = new Proto.AmountMessage
+            {
+                Value = (ulong)(invoice.MinimumAmount?.ToUnit(LightMoneyUnit.Satoshi) ?? 0),
+                Unit = _context.Options.Unit
+            },
+            PaymentId = swap.SwapId
+        };
     }
 
     private async Task<LightningInvoice?> ResolveIncoming(Proto.PaymentIdentifier id, CancellationToken ct)
@@ -275,4 +256,17 @@ public sealed class CdkPaymentProcessorGrpcService : Proto.CdkPaymentProcessor.C
 
     private static RpcException BadRequest(string message)
         => new(new Status(StatusCode.InvalidArgument, message));
+
+    private static NBitcoin.Network ParseNetwork(string value)
+    {
+        return value.ToLowerInvariant() switch
+        {
+            "mainnet" => NBitcoin.Network.Main,
+            "testnet" => NBitcoin.Network.TestNet,
+            "regtest" => NBitcoin.Network.RegTest,
+            "signet" => NBitcoin.Bitcoin.Instance.Signet,
+            "mutinynet" => NBitcoin.Bitcoin.Instance.Mutinynet,
+            _ => throw new InvalidOperationException($"Unsupported NBXplorer network '{value}'.")
+        };
+    }
 }

@@ -7,6 +7,8 @@ public sealed class ProcessorOptions
     public string Unit { get; init; } = "sat";
 
     public string? FundingAddress { get; init; }
+
+    public string? WalletSecret { get; init; }
 }
 
 public sealed class NbxplorerOptions

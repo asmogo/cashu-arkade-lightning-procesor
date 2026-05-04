@@ -1,7 +1,10 @@
 using cdk_arkade_payment_processor.Configuration;
 using cdk_arkade_payment_processor.Services;
 using Microsoft.EntityFrameworkCore;
-using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Options;
+using NArk.Abstractions.Wallets;
+using NArk.Core.Transport;
+using NArk.Core.Wallet;
 using Npgsql;
 
 var builder = WebApplication.CreateBuilder(args);
@@ -13,6 +16,7 @@ builder.Services.AddArkadePaymentProcessor(builder.Configuration);
 var app = builder.Build();
 
 await EnsureDatabaseCreatedAsync(app.Services);
+await EnsureProcessorWalletAsync(app.Services);
 
 app.MapGrpcService<CdkPaymentProcessorGrpcService>();
 app.MapGet("/", () => "CDK Arkade payment processor gRPC server");
@@ -96,4 +100,30 @@ static async Task EnsureDatabaseExistsAsync(IServiceProvider services)
         await using var createCmd = new NpgsqlCommand($"CREATE DATABASE \"{escaped}\"", connection);
         await createCmd.ExecuteNonQueryAsync();
     }
+}
+
+static async Task EnsureProcessorWalletAsync(IServiceProvider services)
+{
+    using var scope = services.CreateScope();
+    var options = scope.ServiceProvider.GetRequiredService<IOptions<ProcessorOptions>>().Value;
+    var walletStorage = scope.ServiceProvider.GetRequiredService<IWalletStorage>();
+
+    var existing = await walletStorage.GetWalletById(options.WalletId);
+    if (existing is not null)
+    {
+        return;
+    }
+
+    if (string.IsNullOrWhiteSpace(options.WalletSecret))
+    {
+        throw new InvalidOperationException(
+            $"Wallet '{options.WalletId}' not found and Processor:WalletSecret is not configured.");
+    }
+
+    var transport = scope.ServiceProvider.GetRequiredService<IClientTransport>();
+    var serverInfo = await transport.GetServerInfoAsync();
+    var destination = string.IsNullOrWhiteSpace(options.FundingAddress) ? null : options.FundingAddress;
+    var wallet = await WalletFactory.CreateWallet(options.WalletSecret, destination, serverInfo);
+    wallet = wallet with { Id = options.WalletId };
+    await walletStorage.UpsertWallet(wallet, updateIfExists: false);
 }

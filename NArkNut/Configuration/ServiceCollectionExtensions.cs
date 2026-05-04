@@ -18,7 +18,7 @@ namespace cdk_arkade_payment_processor.Configuration;
 
 public static class ServiceCollectionExtensions
 {
-    public static IServiceCollection AddArkadePaymentProcessor(
+    public static void AddArkadePaymentProcessor(
         this IServiceCollection services,
         IConfiguration configuration)
     {
@@ -56,14 +56,12 @@ public static class ServiceCollectionExtensions
             return new CachedBoltzClient(new HttpClient(), options);
         });
         services.AddSingleton<BoltzClient>(sp => sp.GetRequiredService<CachedBoltzClient>());
-
         services.AddSingleton<ArkSwapLightningService>();
+        services.AddSingleton<IncomingPaymentEventBus>();
         services.AddGrpc();
-
-        return services;
     }
 
-    public static ProcessorOptions AddArkadePaymentProcessorConfiguration(
+    public static void AddArkadePaymentProcessorConfiguration(
         this IServiceCollection services,
         IConfiguration configuration)
     {
@@ -88,8 +86,6 @@ public static class ServiceCollectionExtensions
             new ProcessorContext(
                 sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<ProcessorOptions>>().Value,
                 sp.GetRequiredService<ArkNetworkConfig>()));
-
-        return processorOptions;
     }
 
     private static NBitcoin.Network ParseNetwork(string value)
