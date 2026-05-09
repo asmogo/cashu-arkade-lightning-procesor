@@ -28,11 +28,11 @@ public sealed class CdkPaymentProcessorGrpcService : Proto.CdkPaymentProcessor.C
         _logger = logger;
     }
 
-    public override Task<Proto.SettingsResponse> GetSettings(
+    public override async Task<Proto.SettingsResponse> GetSettings(
         Proto.EmptyRequest request,
         ServerCallContext context)
     {
-        return Task.FromResult(new Proto.SettingsResponse
+        var response = new Proto.SettingsResponse
         {
             Unit = _context.Options.Unit,
             Bolt11 = new Proto.Bolt11Settings
@@ -40,7 +40,29 @@ public sealed class CdkPaymentProcessorGrpcService : Proto.CdkPaymentProcessor.C
                 Amountless = false,
                 InvoiceDescription = true
             }
-        });
+        };
+
+        try
+        {
+            var outgoing = await _lightning.GetOutgoingLimitsAsync(context.CancellationToken);
+            var incoming = await _lightning.GetIncomingLimitsAsync(context.CancellationToken);
+            if (outgoing is not null)
+            {
+                response.Custom["melt_min_sat"] = outgoing.MinAmount.ToString();
+                response.Custom["melt_max_sat"] = outgoing.MaxAmount.ToString();
+            }
+            if (incoming is not null)
+            {
+                response.Custom["mint_min_sat"] = incoming.MinAmount.ToString();
+                response.Custom["mint_max_sat"] = incoming.MaxAmount.ToString();
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Could not fetch Boltz limits for GetSettings");
+        }
+
+        return response;
     }
 
     public override async Task<Proto.CreatePaymentResponse> CreatePayment(
@@ -91,7 +113,7 @@ public sealed class CdkPaymentProcessorGrpcService : Proto.CdkPaymentProcessor.C
         }
     }
 
-    public override Task<Proto.PaymentQuoteResponse> GetPaymentQuote(
+    public override async Task<Proto.PaymentQuoteResponse> GetPaymentQuote(
         Proto.PaymentQuoteRequest request,
         ServerCallContext context)
     {
@@ -101,23 +123,41 @@ public sealed class CdkPaymentProcessorGrpcService : Proto.CdkPaymentProcessor.C
                 throw BadRequest("Only bolt11 outgoing quote is supported");
 
             var pr = BOLT11PaymentRequest.Parse(request.Request, _network);
-            var amount = (ulong)(pr.MinimumAmount?.ToUnit(LightMoneyUnit.Satoshi) ?? 0);
+            var amountSats = (long)(pr.MinimumAmount?.ToUnit(LightMoneyUnit.Satoshi) ?? 0);
             var paymentHash = pr.PaymentHash?.ToString()
                 ?? throw BadRequest("Invoice has no payment hash.");
 
-            return Task.FromResult(new Proto.PaymentQuoteResponse
+            var limits = await _lightning.GetOutgoingLimitsAsync(context.CancellationToken);
+            if (limits is not null)
+            {
+                if (amountSats < limits.MinAmount)
+                    throw new PaymentValidationException($"Amount {amountSats} sats is below minimum {limits.MinAmount} sats for melt");
+                if (amountSats > limits.MaxAmount)
+                    throw new PaymentValidationException($"Amount {amountSats} sats exceeds maximum {limits.MaxAmount} sats for melt");
+            }
+
+            var feeSats = limits is not null
+                ? (ulong)Math.Ceiling(amountSats * (double)limits.FeePercentage / 100.0) + (ulong)limits.MinerFee
+                : 0UL;
+
+            return new Proto.PaymentQuoteResponse
             {
                 RequestIdentifier = new Proto.PaymentIdentifier
                 {
                     Type = Proto.PaymentIdentifierType.PaymentHash,
                     Hash = paymentHash
                 },
-                Amount = new Proto.AmountMessage { Value = amount, Unit = _context.Options.Unit },
-                Fee = new Proto.AmountMessage { Value = 0, Unit = _context.Options.Unit },
+                Amount = new Proto.AmountMessage { Value = (ulong)amountSats, Unit = _context.Options.Unit },
+                Fee = new Proto.AmountMessage { Value = feeSats, Unit = _context.Options.Unit },
                 State = Proto.QuoteState.Issued
-            });
+            };
         }
         catch (RpcException) { throw; }
+        catch (OperationCanceledException) { throw; }
+        catch (PaymentValidationException ex)
+        {
+            throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
+        }
         catch (Exception ex)
         {
             _logger.LogError(ex, "GetPaymentQuote failed");

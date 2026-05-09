@@ -1,5 +1,6 @@
 using BTCPayServer.Lightning;
 using NArk.Abstractions.Contracts;
+using NArk.Abstractions.Safety;
 using NArk.Core.Contracts;
 using NArk.Core.Transport;
 using NArk.Swaps.Abstractions;
@@ -16,6 +17,7 @@ public sealed class ArkSwapLightningService(
     BoltzLimitsValidator boltzLimitsValidator,
     ISwapStorage swapStorage,
     IContractStorage contractStorage,
+    ISafetyService safetyService,
     ILogger<ArkSwapLightningService> logger)
 {
     public async Task<LightningInvoice> CreateInvoice(string walletId, long amountSats, string description, TimeSpan expiry, CancellationToken ct)
@@ -42,11 +44,19 @@ public sealed class ArkSwapLightningService(
         var pr = BOLT11PaymentRequest.Parse(bolt11, serverInfo.Network);
         var amountSats = (long)(pr.MinimumAmount?.ToUnit(LightMoneyUnit.Satoshi) ?? 0);
 
+        var lockKey = $"pay-invoice:{pr.PaymentHash}";
+        await using var _ = await safetyService.LockKeyAsync(lockKey, ct);
+
+        var existing = await GetSwapByInvoice(walletId, bolt11, ct);
+        if (existing is not null && existing.SwapType == ArkSwapType.Submarine)
+        {
+            var existingContract = await GetContract(walletId, existing.ContractScript, ct);
+            return MapPayment(existing, existingContract, serverInfo.Network);
+        }
+
         var (isValid, error) = await boltzLimitsValidator.ValidateAmountAsync(amountSats, isReverse: false, ct);
         if (!isValid)
-        {
             throw new PaymentValidationException(error ?? "Invalid submarine swap amount");
-        }
 
         await swapsManagementService.InitiateSubmarineSwap(walletId, pr, autoPay: true, ct);
 
@@ -55,6 +65,12 @@ public sealed class ArkSwapLightningService(
         var contract = await GetContract(walletId, swap.ContractScript, ct);
         return MapPayment(swap, contract, serverInfo.Network);
     }
+
+    public Task<BoltzLimits?> GetOutgoingLimitsAsync(CancellationToken ct)
+        => boltzLimitsValidator.GetLimitsAsync(isReverse: false, ct);
+
+    public Task<BoltzLimits?> GetIncomingLimitsAsync(CancellationToken ct)
+        => boltzLimitsValidator.GetLimitsAsync(isReverse: true, ct);
 
     public async Task<LightningInvoice?> GetIncomingById(string walletId, string id, CancellationToken ct)
     {
