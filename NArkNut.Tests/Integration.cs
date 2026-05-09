@@ -1,6 +1,8 @@
+using System.Text.Json.Nodes;
 using DotNut;
 using DotNut.Abstractions;
 using DotNut.Api;
+using DotNut.ApiModels;
 
 namespace cdk_arkade_payment_processor.Tests;
 
@@ -50,7 +52,7 @@ public class Integration
 
         var wallet = Wallet.Create().WithMint(MintUrl);
         const ulong mintAmount = 50_000;
-        dynamic? mintHandler = null;
+        IMintHandler<PostMintQuoteBolt11Response, List<Proof>> mintHandler = null;
         Exception? lastQuoteError = null;
         for (var i = 0; i < 5; i++)
         {
@@ -78,12 +80,9 @@ public class Integration
         var mintQuote = mintHandler.GetQuote();
         Assert.NotNull(mintQuote.Request);
         await DockerHelper.PayLndInvoice(mintQuote.Request);
-        await DockerHelper.WaitForLndInvoicePaidByBolt11(
-            mintQuote.Request,
-            timeout: TimeSpan.FromSeconds(60),
-            pollInterval: TimeSpan.FromMilliseconds(500));
+
         IEnumerable<DotNut.Proof>? proofs = null;
-        for (var i = 0; i < 120; i++)
+        for (var i = 0; i < 240; i++)
         {
             try
             {
@@ -104,48 +103,69 @@ public class Integration
         var enumerable = proofs as Proof[] ?? proofs.ToArray();
         Assert.Equal(mintAmount, enumerable.Select(p => p.Amount).Aggregate(0UL, (a, b) => a + b));
 
-        var meltInvoice = await DockerHelper.CreateLndInvoice(1000);
+        var meltInvoice = await DockerHelper.CreateLndInvoice(1000, expirySecs: 120);
         var meltQuote = await wallet
             .CreateMeltQuote()
             .WithInvoice(meltInvoice)
             .ProcessAsyncBolt11();
 
-        await DockerHelper.WaitForLndInvoicePaidByBolt11(
-            meltInvoice,
-            timeout: TimeSpan.FromSeconds(60),
-            pollInterval: TimeSpan.FromMilliseconds(500));
         var change = await meltQuote.Melt(enumerable);
         Assert.NotNull(change);
         
     }
 
-    private static async Task EnsureFulmineLiquidity()
+    private static async Task EnsureFulmineLiquidity(long minBalanceSats = 200_000, int maxAttempts = 10)
     {
-        using var http = new HttpClient();
-        http.BaseAddress = new Uri(FulmineUrl);
-        http.Timeout = TimeSpan.FromSeconds(8);
+        using var http = new HttpClient { BaseAddress = new Uri(FulmineUrl), Timeout = TimeSpan.FromSeconds(15) };
 
+        for (var attempt = 0; attempt < maxAttempts; attempt++)
+        {
+            var balance = await GetFulmineArkBalance(http);
+            if (balance >= minBalanceSats)
+                return;
+
+            await FundFulmineBoarding(http);
+
+            for (var i = 0; i < 6; i++)
+                await DockerHelper.MineBlocks();
+            await Task.Delay(TimeSpan.FromSeconds(2));
+
+            try { await http.GetAsync("/api/v1/settle"); } catch { }
+
+            await Task.Delay(TimeSpan.FromSeconds(15));
+
+            for (var i = 0; i < 6; i++)
+                await DockerHelper.MineBlocks();
+            await Task.Delay(TimeSpan.FromSeconds(3));
+        }
+    }
+
+    private static async Task<long> GetFulmineArkBalance(HttpClient http)
+    {
         try
         {
-            await http.GetAsync("/api/v1/settle");
+            var json = JsonNode.Parse(await http.GetStringAsync("/api/v1/balance"));
+            var value = json?["offchain"] ?? json?["amount"];
+            return long.TryParse(value?.ToString(), out var b) ? b : 0;
         }
-        catch
-        {
-            // best effort; readiness is validated by succeeding quote creation
-        }
+        catch { return 0; }
+    }
 
-        for (var i = 0; i < 6; i++)
-            await DockerHelper.MineBlocks();
-
-        await Task.Delay(5000);
-
+    private static async Task FundFulmineBoarding(HttpClient http)
+    {
         try
         {
-            await http.GetStringAsync("/api/v1/balance");
+            var json = JsonNode.Parse(await http.GetStringAsync("/api/v1/address"));
+            var arkAddress = json?["address"]?.GetValue<string>();
+            if (string.IsNullOrWhiteSpace(arkAddress)) return;
+
+            // Ark address may be in URI format (e.g. "ark:bcrt1p...") — extract the path component
+            var onchainAddress = Uri.TryCreate(arkAddress, UriKind.Absolute, out var uri)
+                ? uri.AbsolutePath.TrimStart('/')
+                : arkAddress;
+
+            await DockerHelper.SendBitcoinToAddress(onchainAddress);
         }
-        catch
-        {
-            // best effort, quote creation retry handles transient readiness
-        }
+        catch { }
     }
 }

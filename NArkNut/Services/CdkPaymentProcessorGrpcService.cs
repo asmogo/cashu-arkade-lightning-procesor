@@ -99,13 +99,15 @@ public sealed class CdkPaymentProcessorGrpcService : Proto.CdkPaymentProcessor.C
 
         var pr = BOLT11PaymentRequest.Parse(request.Request, _network);
         var amount = (ulong)(pr.MinimumAmount?.ToUnit(LightMoneyUnit.Satoshi) ?? 0);
+        var paymentHash = pr.PaymentHash?.ToString()
+            ?? throw new InvalidOperationException("Invoice has no payment hash.");
 
         return Task.FromResult(new Proto.PaymentQuoteResponse
         {
             RequestIdentifier = new Proto.PaymentIdentifier
             {
-                Type = Proto.PaymentIdentifierType.QuoteId,
-                Id = pr.PaymentHash?.ToString() ?? Guid.NewGuid().ToString("N")
+                Type = Proto.PaymentIdentifierType.PaymentHash,
+                Hash = paymentHash
             },
             Amount = new Proto.AmountMessage { Value = amount, Unit = _context.Options.Unit },
             Fee = new Proto.AmountMessage { Value = 0, Unit = _context.Options.Unit },

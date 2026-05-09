@@ -28,6 +28,10 @@ public static class DockerHelper
     public static async Task MineBlocks(int count = 6, CancellationToken ct = default)
         => await Exec("bitcoin",
             ["bitcoin-cli", "-rpcwallet=", "-generate", count.ToString(CultureInfo.InvariantCulture)], ct);
+
+    public static async Task<string> SendBitcoinToAddress(string address, decimal amountBtc = 1m, CancellationToken ct = default)
+        => (await Exec("bitcoin",
+            ["bitcoin-cli", "-rpcwallet=", "sendtoaddress", address, amountBtc.ToString("F8", CultureInfo.InvariantCulture)], ct)).Trim();
     public static async Task<string> CreateLndInvoice(long amtSats = 10000, int expirySecs = 30,
         CancellationToken ct = default)
     {
