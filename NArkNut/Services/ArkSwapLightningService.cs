@@ -24,7 +24,7 @@ public sealed class ArkSwapLightningService(
         var amount = LightMoney.Satoshis(amountSats);
 
         var (isValid, error) = await boltzLimitsValidator.ValidateAmountAsync(amountSats, isReverse: true, ct);
-        if (!isValid)
+         if (!isValid)
         {
             throw new InvalidOperationException(error ?? "Invalid reverse swap amount");
         }
@@ -71,7 +71,8 @@ public sealed class ArkSwapLightningService(
     public async Task<LightningInvoice?> GetIncomingByHash(string walletId, string hash, CancellationToken ct)
     {
         var serverInfo = await clientTransport.GetServerInfoAsync(ct);
-        var swaps = await swapStorage.GetSwaps(walletIds: [walletId], swapTypes: [ArkSwapType.ReverseSubmarine], hashes: [hash], cancellationToken: ct);
+        var candidateHashes = CandidateHashes(hash);
+        var swaps = await swapStorage.GetSwaps(walletIds: [walletId], swapTypes: [ArkSwapType.ReverseSubmarine], hashes: candidateHashes, cancellationToken: ct);
         var swap = swaps.FirstOrDefault();
         if (swap is null) return null;
         var contract = await GetContract(walletId, swap.ContractScript, ct);
@@ -91,7 +92,8 @@ public sealed class ArkSwapLightningService(
     public async Task<LightningPayment?> GetOutgoingByHash(string walletId, string hash, CancellationToken ct)
     {
         var serverInfo = await clientTransport.GetServerInfoAsync(ct);
-        var swaps = await swapStorage.GetSwaps(walletIds: [walletId], swapTypes: [ArkSwapType.Submarine], hashes: [hash], cancellationToken: ct);
+        var candidateHashes = CandidateHashes(hash);
+        var swaps = await swapStorage.GetSwaps(walletIds: [walletId], swapTypes: [ArkSwapType.Submarine], hashes: candidateHashes, cancellationToken: ct);
         var swap = swaps.FirstOrDefault();
         if (swap is null) return null;
         var contract = await GetContract(walletId, swap.ContractScript, ct);
@@ -185,5 +187,38 @@ public sealed class ArkSwapLightningService(
             CreatedAt = swap.CreatedAt,
             AmountSent = LightMoney.Satoshis(swap.ExpectedAmount)
         };
+    }
+
+    private static string[] CandidateHashes(string hash)
+    {
+        var normalized = hash.Trim().ToLowerInvariant();
+        if (string.IsNullOrWhiteSpace(normalized))
+            return [];
+
+        if (TryReverseHexByByte(normalized, out var reversed) && !string.Equals(reversed, normalized, StringComparison.Ordinal))
+            return [normalized, reversed];
+
+        return [normalized];
+    }
+
+    private static bool TryReverseHexByByte(string hex, out string reversedHex)
+    {
+        reversedHex = string.Empty;
+        if (hex.Length % 2 != 0)
+        {
+            return false;
+        }
+
+        try
+        {
+            var bytes = Convert.FromHexString(hex);
+            Array.Reverse(bytes);
+            reversedHex = Convert.ToHexString(bytes).ToLowerInvariant();
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
     }
 }

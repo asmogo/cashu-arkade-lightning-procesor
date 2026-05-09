@@ -8,10 +8,12 @@ namespace cdk_arkade_payment_processor.Services;
 public sealed class IncomingPaymentEventBus : IDisposable
 {
     private readonly ConcurrentDictionary<Guid, Channel<ArkSwap>> _subscribers = new();
+    private readonly ISwapStorage _swapStorage;
 
     public IncomingPaymentEventBus(ISwapStorage swapStorage)
     {
-        swapStorage.SwapsChanged += OnSwapChanged;
+        _swapStorage = swapStorage;
+        _swapStorage.SwapsChanged += OnSwapChanged;
     }
 
     public IAsyncEnumerable<ArkSwap> Subscribe(CancellationToken cancellationToken)
@@ -60,6 +62,8 @@ public sealed class IncomingPaymentEventBus : IDisposable
 
     public void Dispose()
     {
+        _swapStorage.SwapsChanged -= OnSwapChanged;
+
         foreach (var channel in _subscribers.Values)
         {
             channel.Writer.TryComplete();

@@ -1,0 +1,137 @@
+name: Regtest Backend E2E
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  regtest-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Setup Go (for nigiri build)
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+
+      - name: Cache nigiri build
+        uses: actions/cache@v4
+        with:
+          path: submodules/NArk/regtest/_build
+          key: nigiri-${{ runner.os }}-${{ hashFiles('submodules/NArk/regtest/.env.defaults', '.env.regtest') }}
+
+      - name: Prepare env files
+        run: |
+          cp .env.example .env
+          cat > .env.regtest <<'EOF'
+          NIGIRI_BRANCH=master
+          BITCOIN_LOW_FEE=false
+          EOF
+
+      - name: Start Arkade regtest stack
+        run: ./submodules/NArk/regtest/start-env.sh --clean
+
+      - name: Fix Bitcoin Core v30 + NBXplorer compatibility
+        run: |
+          # Bitcoin Core v30 requires: (1) NBXplorer whitelisted as P2P peer to receive
+          # block data, and (2) enough chain work to exit Initial Block Download mode.
+          # In regtest, IBD exits after ~600 blocks due to v30's minimum chain work check.
+
+          docker exec bitcoin sh -c 'echo "whitelist=0.0.0.0/0" >> /data/.bitcoin/bitcoin.conf'
+          docker restart bitcoin
+          sleep 10
+
+          ADDR=$(docker exec bitcoin bitcoin-cli -regtest getnewaddress)
+          for i in $(seq 1 35); do
+            IBD=$(docker exec bitcoin bitcoin-cli -regtest getblockchaininfo 2>/dev/null \
+              | grep '"initialblockdownload"' | grep -c 'false' || true)
+            if [ "$IBD" -gt 0 ]; then
+              echo "Bitcoin Core exited IBD after $(( i * 20 )) additional blocks"
+              break
+            fi
+            docker exec bitcoin bitcoin-cli -regtest generatetoaddress 20 "$ADDR" > /dev/null
+          done
+
+          docker exec bitcoin bitcoin-cli -regtest getblockchaininfo \
+            | grep -E '"blocks"|"initialblockdownload"|"verificationprogress"'
+
+          NBXPLORER=$(docker ps --format '{{.Names}}' | grep nbxplorer | head -1)
+          docker restart "$NBXPLORER"
+
+      - name: Wait for NBXplorer and Ark services
+        run: |
+          for i in $(seq 1 90); do
+            if curl -fsS http://localhost:32838/v1/cryptos/btc/status 2>/dev/null \
+                | grep -q '"isFullySynched":true'; then
+              echo "NBXplorer ready"
+              break
+            fi
+            sleep 2
+          done
+          curl -fsS http://localhost:32838/v1/cryptos/btc/status | grep '"isFullySynched":true'
+          curl -fsS http://localhost:7070/v1/info >/dev/null
+          curl -fsS http://localhost:9069/version >/dev/null
+
+      - name: Build and start backend stack
+        run: docker compose up -d --build cdk-arkade-payment-processor cdk-mintd
+
+      - name: Wait for backend container
+        run: |
+          for i in $(seq 1 60); do
+            if curl -fsS http://localhost:8080/ >/dev/null 2>&1; then
+              echo "Backend ready"
+              break
+            fi
+            sleep 2
+          done
+          curl -fsS http://localhost:8080/
+
+      - name: Wait for CDK mintd
+        run: |
+          for i in $(seq 1 90); do
+            if curl -fsS http://localhost:3338/v1/info >/dev/null 2>&1; then
+              echo "CDK mint ready"
+              break
+            fi
+            sleep 2
+          done
+          curl -fsS http://localhost:3338/v1/info
+
+      - name: Run C# tests
+        run: dotnet test NArkNut.Tests/NArkNut.Tests.csproj --configuration Release --verbosity normal
+        env:
+          RUN_REGTEST_INTEGRATION: "1"
+
+      - name: Backend logs on failure
+        if: failure()
+        run: docker compose logs --no-color cdk-arkade-payment-processor cdk-mintd
+
+      - name: Regtest logs on failure
+        if: failure()
+        run: |
+          docker ps -a
+          docker logs arkd || true
+          docker logs boltz || true
+          docker logs boltz-lnd || true
+          docker logs fulmine || true
+          docker logs nbxplorer || true
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker compose down -v --remove-orphans || true
+          ./submodules/NArk/regtest/clean-env.sh || true

@@ -5,7 +5,6 @@ using Microsoft.Extensions.Options;
 using NArk.Abstractions.Wallets;
 using NArk.Core.Transport;
 using NArk.Core.Wallet;
-using Npgsql;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -15,7 +14,7 @@ builder.Services.AddArkadePaymentProcessor(builder.Configuration);
 
 var app = builder.Build();
 
-await EnsureDatabaseCreatedAsync(app.Services);
+await app.Services.GetRequiredService<MigrationRunner>().ExecuteAsync();
 await EnsureProcessorWalletAsync(app.Services);
 
 app.MapGrpcService<CdkPaymentProcessorGrpcService>();
@@ -52,53 +51,8 @@ static void LoadDotEnv(string rootPath)
             value = value[1..^1];
         }
 
-        Environment.SetEnvironmentVariable(key, value);
-    }
-}
-
-static async Task EnsureDatabaseCreatedAsync(IServiceProvider services)
-{
-    using var scope = services.CreateScope();
-    await EnsureDatabaseExistsAsync(scope.ServiceProvider);
-
-    var dbFactory = scope.ServiceProvider.GetRequiredService<IDbContextFactory<ProcessorDbContext>>();
-    await using var db = await dbFactory.CreateDbContextAsync();
-    await db.Database.EnsureCreatedAsync();
-}
-
-static async Task EnsureDatabaseExistsAsync(IServiceProvider services)
-{
-    var configuration = services.GetRequiredService<IConfiguration>();
-    var connectionString = configuration.GetConnectionString("Ark");
-    if (string.IsNullOrWhiteSpace(connectionString))
-    {
-        return;
-    }
-
-    var csb = new NpgsqlConnectionStringBuilder(connectionString);
-    if (string.IsNullOrWhiteSpace(csb.Database))
-    {
-        return;
-    }
-
-    var targetDatabase = csb.Database;
-    var adminCsb = new NpgsqlConnectionStringBuilder(connectionString)
-    {
-        Database = "postgres"
-    };
-
-    await using var connection = new NpgsqlConnection(adminCsb.ConnectionString);
-    await connection.OpenAsync();
-
-    await using var existsCmd = new NpgsqlCommand("SELECT 1 FROM pg_database WHERE datname = @name", connection);
-    existsCmd.Parameters.AddWithValue("name", targetDatabase);
-    var exists = await existsCmd.ExecuteScalarAsync() is not null;
-
-    if (!exists)
-    {
-        var escaped = targetDatabase.Replace("\"", "\"\"");
-        await using var createCmd = new NpgsqlCommand($"CREATE DATABASE \"{escaped}\"", connection);
-        await createCmd.ExecuteNonQueryAsync();
+        if (Environment.GetEnvironmentVariable(key) is null)
+            Environment.SetEnvironmentVariable(key, value);
     }
 }
 

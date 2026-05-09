@@ -16,6 +16,9 @@ services:
       ArkNetwork__ExplorerUri: ${EXPLORER_URI:-http://chopsticks:3000}
       NBXplorer__Uri: ${NBXPLORER_URI:-http://nbxplorer:32838/}
       NBXplorer__Network: ${NBXPLORER_NETWORK:-Regtest}
+      Processor__WalletId: ${PROCESSOR_WALLET_ID:-arkade-mint}
+      Processor__WalletSecret: ${PROCESSOR_WALLET_SECRET:-abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about}
+      Processor__Unit: ${PROCESSOR_UNIT:-sat}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     ports:
@@ -36,6 +39,14 @@ services:
       CDK_MINTD_LISTEN_PORT: 8085
       CDK_MINTD_DATABASE: sqlite
       CDK_MINTD_MNEMONIC: "monkey chase banana monkey chase banana monkey chase banana monkey chase wrong"
+      CDK_MINTD_MINT_NAME: "Arkade Regtest Mint"
+      CDK_MINTD_MINT_DESCRIPTION: "Cashu mint for Arkade regtest integration"
+      CDK_MINTD_MINT_DESCRIPTION_LONG: "Local development mint wired to cdk-arkade-payment-processor on regtest."
+      CDK_MINTD_MINT_MOTD: "Development only. Do not use with real funds."
+      CDK_MINTD_MINT_CONTACT_EMAIL: "devnull@example.local"
+      CDK_MINTD_MINT_CONTACT_NOSTR: "npub1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqzqujme"
+      CDK_MINTD_MINT_ICON_URL: "https://arkadeos.com/favicon.ico"
+      CDK_MINTD_MINT_TOS_URL: "https://arkadeos.com/terms"
       CDK_MINTD_LN_BACKEND: grpcprocessor
       CDK_MINTD_GRPC_PAYMENT_PROCESSOR_SUPPORTED_UNITS: sat
       CDK_MINTD_GRPC_PAYMENT_PROCESSOR_ADDRESS: http://cdk-arkade-payment-processor

@@ -26,7 +26,7 @@ public static class ServiceCollectionExtensions
         services.AddHttpClient();
 
         var connectionString = configuration.GetConnectionString("Ark")
-                               ?? "Host=localhost;Port=5432;Database=cdk_arkade_processor;Username=postgres;Password=postgres;GSS Encryption Mode=Disable";
+                               ?? throw new InvalidOperationException("ConnectionStrings:Ark is required.");
 
         services.AddDbContextFactory<ProcessorDbContext>(options => options.UseNpgsql(connectionString));
         services.AddArkEfCoreStorage<ProcessorDbContext>();
@@ -39,25 +39,27 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IChainTimeProvider>(sp =>
         {
             var opts = sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<NbxplorerOptions>>().Value;
-            return new ChainTimeProvider(ParseNetwork(opts.Network), new Uri(opts.Uri));
+            return new ChainTimeProvider(NetworkParser.Parse(opts.Network), new Uri(opts.Uri));
         });
         services.AddSingleton<IWalletProvider, DefaultWalletProvider>();
         services.AddSingleton<IAssetManager, AssetManager>();
         services.AddSingleton<IBoardingUtxoProvider>(sp =>
         {
             var opts = sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<NbxplorerOptions>>().Value;
-            return new NBXplorerBoardingUtxoProvider(ParseNetwork(opts.Network), new Uri(opts.Uri));
+            return new NBXplorerBoardingUtxoProvider(NetworkParser.Parse(opts.Network), new Uri(opts.Uri));
         });
         services.AddSingleton<BoardingUtxoSyncService>();
 
         services.AddSingleton<CachedBoltzClient>(sp =>
         {
+            var factory = sp.GetRequiredService<IHttpClientFactory>();
             var options = sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<NArk.Swaps.Boltz.Models.BoltzClientOptions>>();
-            return new CachedBoltzClient(new HttpClient(), options);
+            return new CachedBoltzClient(factory.CreateClient("boltz"), options);
         });
         services.AddSingleton<BoltzClient>(sp => sp.GetRequiredService<CachedBoltzClient>());
         services.AddSingleton<ArkSwapLightningService>();
         services.AddSingleton<IncomingPaymentEventBus>();
+        services.AddSingleton<MigrationRunner>();
         services.AddGrpc();
     }
 
@@ -67,7 +69,6 @@ public static class ServiceCollectionExtensions
     {
         var processorSection = configuration.GetSection("Processor");
         services.Configure<ProcessorOptions>(processorSection);
-        var processorOptions = processorSection.Get<ProcessorOptions>() ?? new ProcessorOptions();
         services.Configure<NbxplorerOptions>(configuration.GetRequiredSection("NBXplorer"));
 
         var networkSection = configuration.GetRequiredSection("ArkNetwork");
@@ -86,18 +87,5 @@ public static class ServiceCollectionExtensions
             new ProcessorContext(
                 sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<ProcessorOptions>>().Value,
                 sp.GetRequiredService<ArkNetworkConfig>()));
-    }
-
-    private static NBitcoin.Network ParseNetwork(string value)
-    {
-        return value.ToLowerInvariant() switch
-        {
-            "mainnet" => NBitcoin.Network.Main,
-            "testnet" => NBitcoin.Network.TestNet,
-            "regtest" => NBitcoin.Network.RegTest,
-            "signet" => NBitcoin.Bitcoin.Instance.Signet,
-            "mutinynet" => NBitcoin.Bitcoin.Instance.Mutinynet,
-            _ => throw new InvalidOperationException($"Unsupported NBXplorer network '{value}'.")
-        };
     }
 }

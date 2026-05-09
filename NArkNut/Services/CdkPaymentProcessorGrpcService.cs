@@ -24,7 +24,7 @@ public sealed class CdkPaymentProcessorGrpcService : Proto.CdkPaymentProcessor.C
         _context = context;
         _lightning = lightning;
         _incomingPaymentEvents = incomingPaymentEvents;
-        _network = ParseNetwork(nbxplorerOptions.Value.Network);
+        _network = NetworkParser.Parse(nbxplorerOptions.Value.Network);
         _logger = logger;
     }
 
@@ -65,12 +65,15 @@ public sealed class CdkPaymentProcessorGrpcService : Proto.CdkPaymentProcessor.C
                 TimeSpan.FromSeconds(expirySeconds),
                 context.CancellationToken);
 
+            var invoiceHash = invoice.PaymentHash
+                ?? throw new InvalidOperationException("Created invoice has no payment hash.");
+
             return new Proto.CreatePaymentResponse
             {
                 RequestIdentifier = new Proto.PaymentIdentifier
                 {
                     Type = Proto.PaymentIdentifierType.PaymentHash,
-                    Hash = invoice.PaymentHash ?? string.Empty
+                    Hash = invoiceHash
                 },
                 Request = invoice.BOLT11,
                 Expiry = (ulong)invoice.ExpiresAt.ToUnixTimeSeconds()
@@ -130,19 +133,29 @@ public sealed class CdkPaymentProcessorGrpcService : Proto.CdkPaymentProcessor.C
 
         if (invoice?.Status == LightningInvoiceStatus.Paid)
         {
+            var paymentHash = invoice.PaymentHash;
+            Proto.PaymentIdentifier identifier;
+            string paymentId;
+            if (!string.IsNullOrWhiteSpace(paymentHash))
+            {
+                identifier = new Proto.PaymentIdentifier { Type = Proto.PaymentIdentifierType.PaymentHash, Hash = paymentHash };
+                paymentId = paymentHash;
+            }
+            else
+            {
+                identifier = new Proto.PaymentIdentifier { Type = Proto.PaymentIdentifierType.CustomId, Id = invoice.Id };
+                paymentId = invoice.Id;
+            }
+
             response.Payments.Add(new Proto.WaitIncomingPaymentResponse
             {
-                PaymentIdentifier = new Proto.PaymentIdentifier
-                {
-                    Type = Proto.PaymentIdentifierType.PaymentId,
-                    Id = invoice.Id
-                },
+                PaymentIdentifier = identifier,
                 PaymentAmount = new Proto.AmountMessage
                 {
                     Value = (ulong)(invoice.Amount?.ToUnit(LightMoneyUnit.Satoshi) ?? 0),
                     Unit = _context.Options.Unit
                 },
-                PaymentId = invoice.Id
+                PaymentId = paymentId
             });
         }
 
@@ -169,12 +182,10 @@ public sealed class CdkPaymentProcessorGrpcService : Proto.CdkPaymentProcessor.C
         IServerStreamWriter<Proto.PaymentEventResponse> responseStream,
         ServerCallContext context)
     {
-        await foreach (var swap in _incomingPaymentEvents.Subscribe(context.CancellationToken))
-        {
-            if (!string.Equals(swap.WalletId, _context.Options.WalletId, StringComparison.Ordinal))
-                continue;
-            await responseStream.WriteAsync(new Proto.PaymentEventResponse { PaymentReceived = MapIncomingPayment(swap) });
-        }
+        await StreamWalletSwapEvents(
+            responseStream,
+            swap => new Proto.PaymentEventResponse { PaymentReceived = MapIncomingPayment(swap) },
+            context.CancellationToken);
     }
 
     public override async Task WaitIncomingPayment(
@@ -182,30 +193,49 @@ public sealed class CdkPaymentProcessorGrpcService : Proto.CdkPaymentProcessor.C
         IServerStreamWriter<Proto.WaitIncomingPaymentResponse> responseStream,
         ServerCallContext context)
     {
-        await foreach (var swap in _incomingPaymentEvents.Subscribe(context.CancellationToken))
+        await StreamWalletSwapEvents(responseStream, MapIncomingPayment, context.CancellationToken);
+    }
+
+    private async Task StreamWalletSwapEvents<T>(
+        IServerStreamWriter<T> stream,
+        Func<ArkSwap, T> map,
+        CancellationToken ct)
+    {
+        await foreach (var swap in _incomingPaymentEvents.Subscribe(ct))
         {
             if (!string.Equals(swap.WalletId, _context.Options.WalletId, StringComparison.Ordinal))
                 continue;
-            await responseStream.WriteAsync(MapIncomingPayment(swap));
+            await stream.WriteAsync(map(swap));
         }
     }
 
     private Proto.WaitIncomingPaymentResponse MapIncomingPayment(ArkSwap swap)
     {
         var invoice = BOLT11PaymentRequest.Parse(swap.Invoice, _network);
+        var paymentHash = invoice.PaymentHash?.ToString() ?? swap.Hash;
+
+        Proto.PaymentIdentifier identifier;
+        string paymentId;
+        if (!string.IsNullOrWhiteSpace(paymentHash))
+        {
+            identifier = new Proto.PaymentIdentifier { Type = Proto.PaymentIdentifierType.PaymentHash, Hash = paymentHash };
+            paymentId = paymentHash;
+        }
+        else
+        {
+            identifier = new Proto.PaymentIdentifier { Type = Proto.PaymentIdentifierType.CustomId, Id = swap.SwapId };
+            paymentId = swap.SwapId;
+        }
+
         return new Proto.WaitIncomingPaymentResponse
         {
-            PaymentIdentifier = new Proto.PaymentIdentifier
-            {
-                Type = Proto.PaymentIdentifierType.PaymentId,
-                Id = swap.SwapId
-            },
+            PaymentIdentifier = identifier,
             PaymentAmount = new Proto.AmountMessage
             {
                 Value = (ulong)(invoice.MinimumAmount?.ToUnit(LightMoneyUnit.Satoshi) ?? 0),
                 Unit = _context.Options.Unit
             },
-            PaymentId = swap.SwapId
+            PaymentId = paymentId
         };
     }
 
@@ -237,13 +267,27 @@ public sealed class CdkPaymentProcessorGrpcService : Proto.CdkPaymentProcessor.C
             _ => Proto.QuoteState.Unknown
         };
 
+        var paymentHash = payment.PaymentHash ?? string.Empty;
+        var identifierType = string.IsNullOrWhiteSpace(paymentHash)
+            ? Proto.PaymentIdentifierType.CustomId
+            : Proto.PaymentIdentifierType.PaymentHash;
+
+        var paymentIdentifier = new Proto.PaymentIdentifier
+        {
+            Type = identifierType
+        };
+        if (identifierType == Proto.PaymentIdentifierType.PaymentHash)
+        {
+            paymentIdentifier.Hash = paymentHash;
+        }
+        else
+        {
+            paymentIdentifier.Id = payment.Id;
+        }
+
         return new Proto.MakePaymentResponse
         {
-            PaymentIdentifier = new Proto.PaymentIdentifier
-            {
-                Type = Proto.PaymentIdentifierType.PaymentId,
-                Id = payment.Id
-            },
+            PaymentIdentifier = paymentIdentifier,
             PaymentProof = payment.Preimage ?? string.Empty,
             Status = state,
             TotalSpent = new Proto.AmountMessage
@@ -256,17 +300,4 @@ public sealed class CdkPaymentProcessorGrpcService : Proto.CdkPaymentProcessor.C
 
     private static RpcException BadRequest(string message)
         => new(new Status(StatusCode.InvalidArgument, message));
-
-    private static NBitcoin.Network ParseNetwork(string value)
-    {
-        return value.ToLowerInvariant() switch
-        {
-            "mainnet" => NBitcoin.Network.Main,
-            "testnet" => NBitcoin.Network.TestNet,
-            "regtest" => NBitcoin.Network.RegTest,
-            "signet" => NBitcoin.Bitcoin.Instance.Signet,
-            "mutinynet" => NBitcoin.Bitcoin.Instance.Mutinynet,
-            _ => throw new InvalidOperationException($"Unsupported NBXplorer network '{value}'.")
-        };
-    }
 }
