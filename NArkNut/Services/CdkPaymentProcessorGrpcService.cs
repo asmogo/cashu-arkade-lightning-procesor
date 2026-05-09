@@ -32,7 +32,7 @@ public sealed class CdkPaymentProcessorGrpcService : Proto.CdkPaymentProcessor.C
         Proto.EmptyRequest request,
         ServerCallContext context)
     {
-        var response = new Proto.SettingsResponse
+        return Task.FromResult(new Proto.SettingsResponse
         {
             Unit = _context.Options.Unit,
             Bolt11 = new Proto.Bolt11Settings
@@ -40,8 +40,7 @@ public sealed class CdkPaymentProcessorGrpcService : Proto.CdkPaymentProcessor.C
                 Amountless = false,
                 InvoiceDescription = true
             }
-        };
-        return Task.FromResult(response);
+        });
     }
 
     public override async Task<Proto.CreatePaymentResponse> CreatePayment(
@@ -79,9 +78,11 @@ public sealed class CdkPaymentProcessorGrpcService : Proto.CdkPaymentProcessor.C
                 Expiry = (ulong)invoice.ExpiresAt.ToUnixTimeSeconds()
             };
         }
-        catch (RpcException)
+        catch (RpcException) { throw; }
+        catch (OperationCanceledException) { throw; }
+        catch (PaymentValidationException ex)
         {
-            throw;
+            throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
         }
         catch (Exception ex)
         {
@@ -94,89 +95,107 @@ public sealed class CdkPaymentProcessorGrpcService : Proto.CdkPaymentProcessor.C
         Proto.PaymentQuoteRequest request,
         ServerCallContext context)
     {
-        if (request.RequestType != Proto.OutgoingPaymentRequestType.Bolt11Invoice)
-            throw BadRequest("Only bolt11 outgoing quote is supported");
-
-        var pr = BOLT11PaymentRequest.Parse(request.Request, _network);
-        var amount = (ulong)(pr.MinimumAmount?.ToUnit(LightMoneyUnit.Satoshi) ?? 0);
-        var paymentHash = pr.PaymentHash?.ToString()
-            ?? throw new InvalidOperationException("Invoice has no payment hash.");
-
-        return Task.FromResult(new Proto.PaymentQuoteResponse
+        try
         {
-            RequestIdentifier = new Proto.PaymentIdentifier
+            if (request.RequestType != Proto.OutgoingPaymentRequestType.Bolt11Invoice)
+                throw BadRequest("Only bolt11 outgoing quote is supported");
+
+            var pr = BOLT11PaymentRequest.Parse(request.Request, _network);
+            var amount = (ulong)(pr.MinimumAmount?.ToUnit(LightMoneyUnit.Satoshi) ?? 0);
+            var paymentHash = pr.PaymentHash?.ToString()
+                ?? throw BadRequest("Invoice has no payment hash.");
+
+            return Task.FromResult(new Proto.PaymentQuoteResponse
             {
-                Type = Proto.PaymentIdentifierType.PaymentHash,
-                Hash = paymentHash
-            },
-            Amount = new Proto.AmountMessage { Value = amount, Unit = _context.Options.Unit },
-            Fee = new Proto.AmountMessage { Value = 0, Unit = _context.Options.Unit },
-            State = Proto.QuoteState.Issued
-        });
+                RequestIdentifier = new Proto.PaymentIdentifier
+                {
+                    Type = Proto.PaymentIdentifierType.PaymentHash,
+                    Hash = paymentHash
+                },
+                Amount = new Proto.AmountMessage { Value = amount, Unit = _context.Options.Unit },
+                Fee = new Proto.AmountMessage { Value = 0, Unit = _context.Options.Unit },
+                State = Proto.QuoteState.Issued
+            });
+        }
+        catch (RpcException) { throw; }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "GetPaymentQuote failed");
+            throw new RpcException(new Status(StatusCode.Internal, $"GetPaymentQuote failed: {ex.Message}"));
+        }
     }
 
     public override async Task<Proto.MakePaymentResponse> MakePayment(
         Proto.MakePaymentRequest request,
         ServerCallContext context)
     {
-        var bolt11 = request.PaymentOptions?.Bolt11?.Bolt11;
-        if (string.IsNullOrWhiteSpace(bolt11)) throw BadRequest("Only bolt11 outgoing payment is supported");
+        try
+        {
+            var bolt11 = request.PaymentOptions?.Bolt11?.Bolt11;
+            if (string.IsNullOrWhiteSpace(bolt11)) throw BadRequest("Only bolt11 outgoing payment is supported");
 
-        var payment = await _lightning.PayInvoice(_context.Options.WalletId, bolt11, context.CancellationToken);
-        return MapOutgoing(payment);
+            var payment = await _lightning.PayInvoice(_context.Options.WalletId, bolt11, context.CancellationToken);
+            return MapOutgoing(payment);
+        }
+        catch (RpcException) { throw; }
+        catch (OperationCanceledException) { throw; }
+        catch (PaymentValidationException ex)
+        {
+            throw new RpcException(new Status(StatusCode.InvalidArgument, ex.Message));
+        }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "MakePayment failed for wallet {WalletId}", _context.Options.WalletId);
+            throw new RpcException(new Status(StatusCode.Internal, $"MakePayment failed: {ex.Message}"));
+        }
     }
 
     public override async Task<Proto.CheckIncomingPaymentResponse> CheckIncomingPayment(
         Proto.CheckIncomingPaymentRequest request,
         ServerCallContext context)
     {
-        var invoice = await ResolveIncoming(request.RequestIdentifier, context.CancellationToken);
-        var response = new Proto.CheckIncomingPaymentResponse();
-
-        if (invoice?.Status == LightningInvoiceStatus.Paid)
+        try
         {
-            var paymentHash = invoice.PaymentHash;
-            Proto.PaymentIdentifier identifier;
-            string paymentId;
-            if (!string.IsNullOrWhiteSpace(paymentHash))
-            {
-                identifier = new Proto.PaymentIdentifier { Type = Proto.PaymentIdentifierType.PaymentHash, Hash = paymentHash };
-                paymentId = paymentHash;
-            }
-            else
-            {
-                identifier = new Proto.PaymentIdentifier { Type = Proto.PaymentIdentifierType.CustomId, Id = invoice.Id };
-                paymentId = invoice.Id;
-            }
+            var invoice = await ResolveIncoming(request.RequestIdentifier, context.CancellationToken);
+            var response = new Proto.CheckIncomingPaymentResponse();
 
-            response.Payments.Add(new Proto.WaitIncomingPaymentResponse
-            {
-                PaymentIdentifier = identifier,
-                PaymentAmount = new Proto.AmountMessage
-                {
-                    Value = (ulong)(invoice.Amount?.ToUnit(LightMoneyUnit.Satoshi) ?? 0),
-                    Unit = _context.Options.Unit
-                },
-                PaymentId = paymentId
-            });
+            if (invoice?.Status == LightningInvoiceStatus.Paid)
+                response.Payments.Add(MapIncomingPaymentFromInvoice(invoice));
+
+            return response;
         }
-
-        return response;
+        catch (RpcException) { throw; }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "CheckIncomingPayment failed for wallet {WalletId}", _context.Options.WalletId);
+            throw new RpcException(new Status(StatusCode.Internal, $"CheckIncomingPayment failed: {ex.Message}"));
+        }
     }
 
     public override async Task<Proto.MakePaymentResponse> CheckOutgoingPayment(
         Proto.CheckOutgoingPaymentRequest request,
         ServerCallContext context)
     {
-        var payment = await ResolveOutgoing(request.RequestIdentifier, context.CancellationToken);
-        if (payment is null)
-            return new Proto.MakePaymentResponse
-            {
-                Status = Proto.QuoteState.Unknown,
-                TotalSpent = new Proto.AmountMessage { Value = 0, Unit = _context.Options.Unit }
-            };
+        try
+        {
+            var payment = await ResolveOutgoing(request.RequestIdentifier, context.CancellationToken);
+            if (payment is null)
+                return new Proto.MakePaymentResponse
+                {
+                    Status = Proto.QuoteState.Unknown,
+                    TotalSpent = new Proto.AmountMessage { Value = 0, Unit = _context.Options.Unit }
+                };
 
-        return MapOutgoing(payment);
+            return MapOutgoing(payment);
+        }
+        catch (RpcException) { throw; }
+        catch (OperationCanceledException) { throw; }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "CheckOutgoingPayment failed for wallet {WalletId}", _context.Options.WalletId);
+            throw new RpcException(new Status(StatusCode.Internal, $"CheckOutgoingPayment failed: {ex.Message}"));
+        }
     }
 
     public override async Task WaitPaymentEvent(
@@ -207,7 +226,19 @@ public sealed class CdkPaymentProcessorGrpcService : Proto.CdkPaymentProcessor.C
         {
             if (!string.Equals(swap.WalletId, _context.Options.WalletId, StringComparison.Ordinal))
                 continue;
-            await stream.WriteAsync(map(swap));
+
+            T message;
+            try
+            {
+                message = map(swap);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Failed to map swap {SwapId} — skipping", swap.SwapId);
+                continue;
+            }
+
+            await stream.WriteAsync(message, ct);
         }
     }
 
@@ -235,6 +266,34 @@ public sealed class CdkPaymentProcessorGrpcService : Proto.CdkPaymentProcessor.C
             PaymentAmount = new Proto.AmountMessage
             {
                 Value = (ulong)(invoice.MinimumAmount?.ToUnit(LightMoneyUnit.Satoshi) ?? 0),
+                Unit = _context.Options.Unit
+            },
+            PaymentId = paymentId
+        };
+    }
+
+    private Proto.WaitIncomingPaymentResponse MapIncomingPaymentFromInvoice(LightningInvoice invoice)
+    {
+        var paymentHash = invoice.PaymentHash;
+        Proto.PaymentIdentifier identifier;
+        string paymentId;
+        if (!string.IsNullOrWhiteSpace(paymentHash))
+        {
+            identifier = new Proto.PaymentIdentifier { Type = Proto.PaymentIdentifierType.PaymentHash, Hash = paymentHash };
+            paymentId = paymentHash;
+        }
+        else
+        {
+            identifier = new Proto.PaymentIdentifier { Type = Proto.PaymentIdentifierType.CustomId, Id = invoice.Id };
+            paymentId = invoice.Id;
+        }
+
+        return new Proto.WaitIncomingPaymentResponse
+        {
+            PaymentIdentifier = identifier,
+            PaymentAmount = new Proto.AmountMessage
+            {
+                Value = (ulong)(invoice.Amount?.ToUnit(LightMoneyUnit.Satoshi) ?? 0),
                 Unit = _context.Options.Unit
             },
             PaymentId = paymentId
@@ -269,27 +328,16 @@ public sealed class CdkPaymentProcessorGrpcService : Proto.CdkPaymentProcessor.C
             _ => Proto.QuoteState.Unknown
         };
 
-        var paymentHash = payment.PaymentHash ?? string.Empty;
-        var identifierType = string.IsNullOrWhiteSpace(paymentHash)
-            ? Proto.PaymentIdentifierType.CustomId
-            : Proto.PaymentIdentifierType.PaymentHash;
-
-        var paymentIdentifier = new Proto.PaymentIdentifier
-        {
-            Type = identifierType
-        };
-        if (identifierType == Proto.PaymentIdentifierType.PaymentHash)
-        {
-            paymentIdentifier.Hash = paymentHash;
-        }
+        var paymentHash = payment.PaymentHash;
+        Proto.PaymentIdentifier identifier;
+        if (!string.IsNullOrWhiteSpace(paymentHash))
+            identifier = new Proto.PaymentIdentifier { Type = Proto.PaymentIdentifierType.PaymentHash, Hash = paymentHash };
         else
-        {
-            paymentIdentifier.Id = payment.Id;
-        }
+            identifier = new Proto.PaymentIdentifier { Type = Proto.PaymentIdentifierType.CustomId, Id = payment.Id };
 
         return new Proto.MakePaymentResponse
         {
-            PaymentIdentifier = paymentIdentifier,
+            PaymentIdentifier = identifier,
             PaymentProof = payment.Preimage ?? string.Empty,
             Status = state,
             TotalSpent = new Proto.AmountMessage

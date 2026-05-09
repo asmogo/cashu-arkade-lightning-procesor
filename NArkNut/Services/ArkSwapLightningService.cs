@@ -24,10 +24,8 @@ public sealed class ArkSwapLightningService(
         var amount = LightMoney.Satoshis(amountSats);
 
         var (isValid, error) = await boltzLimitsValidator.ValidateAmountAsync(amountSats, isReverse: true, ct);
-         if (!isValid)
-        {
-            throw new InvalidOperationException(error ?? "Invalid reverse swap amount");
-        }
+        if (!isValid)
+            throw new PaymentValidationException(error ?? "Invalid reverse swap amount");
 
         var request = new CreateInvoiceParams(amount, description, expiry);
         var bolt11 = await swapsManagementService.InitiateReverseSwap(walletId, request, ct);
@@ -47,7 +45,7 @@ public sealed class ArkSwapLightningService(
         var (isValid, error) = await boltzLimitsValidator.ValidateAmountAsync(amountSats, isReverse: false, ct);
         if (!isValid)
         {
-            throw new InvalidOperationException(error ?? "Invalid submarine swap amount");
+            throw new PaymentValidationException(error ?? "Invalid submarine swap amount");
         }
 
         await swapsManagementService.InitiateSubmarineSwap(walletId, pr, autoPay: true, ct);
