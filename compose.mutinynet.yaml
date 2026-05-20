@@ -1,0 +1,66 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: cdk-arkade-postgres-mutinynet
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${PROCESSOR_DB:-cdk_arkade_processor}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    volumes:
+      - postgres_mutinynet:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  cdk-arkade-payment-processor:
+    container_name: cdk-arkade-payment-processor-mutinynet
+    platform: linux/amd64
+    build:
+      context: .
+      dockerfile: NArkNut/Dockerfile
+    environment:
+      ASPNETCORE_ENVIRONMENT: ${ASPNETCORE_ENVIRONMENT:-Production}
+      ASPNETCORE_URLS: ${ASPNETCORE_URLS:-http://+:8080}
+      Kestrel__EndpointDefaults__Protocols: Http2
+      ConnectionStrings__Ark: Host=postgres;Port=5432;Database=${PROCESSOR_DB:-cdk_arkade_processor};Username=${POSTGRES_USER:-postgres};Password=${POSTGRES_PASSWORD:-postgres};GSS Encryption Mode=Disable
+      ArkNetwork__ArkUri: ${ARK_URI:-https://mutinynet.arkade.sh}
+      ArkNetwork__ArkadeWalletUri: ${ARKADE_WALLET_URI:-https://mutinynet.arkade.money}
+      ArkNetwork__BoltzUri: ${BOLTZ_URI:-https://api.boltz.mutinynet.arkade.sh/}
+      ArkNetwork__ExplorerUri: ${EXPLORER_URI:-https://explorer.mutinynet.arkade.sh}
+      NBXplorer__Network: Mutinynet
+      Processor__WalletId: ${PROCESSOR_WALLET_ID:-arkade-mint}
+      Processor__WalletSecret: ${PROCESSOR_WALLET_SECRET}
+      Processor__Unit: ${PROCESSOR_UNIT:-sat}
+    ports:
+      - "${PROCESSOR_PORT:-8080}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  cdk-mintd:
+    image: cashubtc/mintd:latest
+    container_name: cdk-mintd-mutinynet
+    restart: unless-stopped
+    ports:
+      - "${CDK_MINT_PORT:-3338}:8085"
+    environment:
+      CDK_MINTD_LISTEN_HOST: 0.0.0.0
+      CDK_MINTD_LISTEN_PORT: 8085
+      CDK_MINTD_DATABASE: sqlite
+      CDK_MINTD_MNEMONIC: ${CDK_MINTD_MNEMONIC}
+      CDK_MINTD_MINT_NAME: ${CDK_MINTD_MINT_NAME:-Arkade Mutinynet Mint}
+      CDK_MINTD_MINT_DESCRIPTION: ${CDK_MINTD_MINT_DESCRIPTION:-Cashu mint on Arkade mutinynet}
+      CDK_MINTD_MINT_MOTD: "Mutinynet only. Do not use with real funds."
+      CDK_MINTD_LN_BACKEND: grpcprocessor
+      CDK_MINTD_GRPC_PAYMENT_PROCESSOR_SUPPORTED_UNITS: sat
+      CDK_MINTD_GRPC_PAYMENT_PROCESSOR_ADDRESS: http://cdk-arkade-payment-processor-mutinynet
+      CDK_MINTD_GRPC_PAYMENT_PROCESSOR_PORT: 8080
+    depends_on:
+      - cdk-arkade-payment-processor
+
+volumes:
+  postgres_mutinynet:

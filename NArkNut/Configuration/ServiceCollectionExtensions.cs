@@ -39,6 +39,11 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IChainTimeProvider>(sp =>
         {
             var opts = sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<NbxplorerOptions>>().Value;
+            if (opts.Network.Equals("mutinynet", StringComparison.OrdinalIgnoreCase))
+            {
+                var arkConfig = sp.GetRequiredService<ArkNetworkConfig>();
+                return new EsploraChainTimeProvider(new Uri(arkConfig.ExplorerUri!));
+            }
             return new ChainTimeProvider(NetworkParser.Parse(opts.Network), new Uri(opts.Uri));
         });
         services.AddSingleton<IWalletProvider, DefaultWalletProvider>();
@@ -46,6 +51,11 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<IBoardingUtxoProvider>(sp =>
         {
             var opts = sp.GetRequiredService<Microsoft.Extensions.Options.IOptions<NbxplorerOptions>>().Value;
+            if (opts.Network.Equals("mutinynet", StringComparison.OrdinalIgnoreCase))
+            {
+                var arkConfig = sp.GetRequiredService<ArkNetworkConfig>();
+                return new EsploraBoardingUtxoProvider(new Uri(arkConfig.ExplorerUri!));
+            }
             return new NBXplorerBoardingUtxoProvider(NetworkParser.Parse(opts.Network), new Uri(opts.Uri));
         });
         services.AddSingleton<BoardingUtxoSyncService>();
